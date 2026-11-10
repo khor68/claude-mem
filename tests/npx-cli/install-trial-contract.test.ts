@@ -526,13 +526,17 @@ describe('installer trial-ready contract', () => {
 
   it('keeps each provider description in the label so both rows always render it', () => {
     // clack's multiselect renders `hint` only for the focused/selected row, so a
-    // description placed there would appear one row at a time. Both rows must
-    // carry their own description at all times.
+    // description placed there would appear one row at a time. Every row must
+    // carry its own description at all times.
     const labels = buildProviderLabels();
     expect(labels.cmemHint).toBe('');
     expect(labels.claudeHint).toBe('');
+    expect(labels.openrouterHint).toBe('');
+    expect(labels.openaiCompatibleHint).toBe('');
     expect(labels.cmem).toContain('30 Day Free Trial');
     expect(labels.claude).toContain('no cloud sync');
+    expect(labels.openrouter).toContain('OpenRouter');
+    expect(labels.openaiCompatible).toContain('OpenAI-compatible');
   });
 
   it('sends the optional email to the signup endpoint', () => {

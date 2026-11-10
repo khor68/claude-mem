@@ -467,7 +467,7 @@ describe('install in GUI mode (interactive TTY, no --provider)', () => {
     // Sign-in waited for the provider choice instead of gating the install.
     expect(questions.some(q => q.startsWith('Select Provider'))).toBe(true);
     expect(providerMenus).toHaveLength(1);
-    expect(providerMenus[0].options.map(option => option.value)).toEqual(['cmem', 'claude']);
+    expect(providerMenus[0].options.map(option => option.value)).toEqual(['cmem', 'claude', 'openrouter', 'openai-compatible']);
     expect(providerMenus[0].initialValues).toEqual(['cmem']);
     expect(lines.join('\n')).toContain('CMEM Pro needs a claude-mem sign-in.');
   });

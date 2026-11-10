@@ -49,3 +49,16 @@ export interface QueryResult {
   answer: string;
   session_id: string;
 }
+
+/**
+ * Per-call options for a corpus agent. `abortController` reaches the caller's
+ * abort signal: the Agent SDK's `Options.abortController` on the Claude path,
+ * the request signal on the API path.
+ *
+ * It lives here, not in `KnowledgeAgent.ts`, because the module that talks to
+ * the Anthropic Agent SDK must not be reachable from the code that picks the
+ * corpus agent — an API-provider install never loads that module at all.
+ */
+export interface KnowledgeAgentCallOptions {
+  abortController?: AbortController;
+}

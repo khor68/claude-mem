@@ -15,6 +15,10 @@ export interface ProviderLabels {
   cmemHint: string;
   claude: string;
   claudeHint: string;
+  openrouter: string;
+  openrouterHint: string;
+  openaiCompatible: string;
+  openaiCompatibleHint: string;
 }
 
 /**
@@ -22,8 +26,8 @@ export interface ProviderLabels {
  *
  * clack's multiselect renders a hint only for the focused, selected, or
  * disabled row — a plain unselected row renders label only. Since this prompt
- * opens with nothing selected, hints would reveal one description at a time as
- * the user arrows around, instead of showing both choices side by side. The
+ * opens with one row selected, hints would reveal one description at a time as
+ * the user arrows around, instead of showing every choice side by side. The
  * parentheses are ours for the same reason: clack adds its own `(...)` around a
  * hint, but never around a label.
  */
@@ -34,6 +38,10 @@ export function buildProviderLabels(): ProviderLabels {
     cmemHint: '',
     claude: 'Use your Anthropic Max Plan (no cloud sync, uses tokens for observations)',
     claudeHint: '',
+    openrouter: 'Use your own OpenRouter account (no cloud sync, uses your OpenRouter API key)',
+    openrouterHint: '',
+    openaiCompatible: 'Use a custom OpenAI-compatible endpoint (no cloud sync, endpoint and key are set in ~/.claude-mem/settings.json)',
+    openaiCompatibleHint: '',
   };
 }
 

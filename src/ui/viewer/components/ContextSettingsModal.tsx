@@ -779,12 +779,13 @@ export function ContextSettingsModal({
 
               <FormField
                 label="Quota Fallback"
-                tooltip="While the selected provider cannot serve (allowance spent, rate limited or over capacity past its retries, unavailable, or repeatedly returning unusable replies), send observation work here until it recovers. Claude (your Anthropic plan) is the default and is used only when a Claude login or key exists. Off: work waits for the provider."
+                tooltip="While the selected provider cannot serve (allowance spent, rate limited or over capacity past its retries, unavailable, or repeatedly returning unusable replies), send observation work here until it recovers. Default: your Anthropic plan backs up a Claude primary and the cmem.ai gateway, and no other provider. Choose Claude to use your plan as the backup for any provider; it is used only when a Claude login or key exists. Off: work waits for the provider."
               >
                 <select
-                  value={formState.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER || 'claude'}
+                  value={formState.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER || ''}
                   onChange={(e) => updateSetting('CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER', e.target.value)}
                 >
+                  <option value="">{t('Default (Claude plan only for a Claude primary or cmem.ai)')}</option>
                   <option value="claude">{t(claudeProviderOptionLabel(formState.CLAUDE_MEM_CLAUDE_AUTH_METHOD))}</option>
                   <option value="off">{t('Off (wait for the provider)')}</option>
                   <option value="gemini">{t('Gemini (uses API key)')}</option>
@@ -793,7 +794,8 @@ export function ContextSettingsModal({
                 </select>
               </FormField>
 
-              {(formState.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER || 'claude') === 'claude' && (
+              {(formState.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER === 'claude'
+                || (!formState.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER && (formState.CLAUDE_MEM_PROVIDER || 'claude') === 'claude')) && (
                 <>
                   <FormField
                     label="Claude Auth Method"
