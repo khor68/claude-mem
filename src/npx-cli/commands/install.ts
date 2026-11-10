@@ -1062,6 +1062,12 @@ type ProviderId = 'claude' | 'codex' | 'gemini' | 'openrouter' | 'openai-compati
  * reach settings.json.
  */
 type ProviderChoice = ProviderId | 'cmem';
+/**
+ * The providers the interactive menu offers. `codex`, `gemini` and `host` are
+ * flag-only (`--provider`), so they never appear here; `cmem` is the prompt-only
+ * CMEM Pro sentinel.
+ */
+const OFFERED_PROVIDER_CHOICES: ProviderChoice[] = ['cmem', 'claude', 'openrouter', 'openai-compatible'];
 // Phase 1d: Persisted DB literals (`server_beta_schema_migrations`, job_type
 // enums, `server-beta-worker` lockedBy marker) are intentionally preserved in
 // the source code; runtime-selector dual-accepts both `'server'` and
@@ -1266,18 +1272,14 @@ export async function promptProvider(
   version: string,
   /** Runs the claude-mem sign-in when CMEM Pro is picked and no pairing exists yet. */
   signIn?: () => Promise<InstallerOAuthPairing | null>,
+  /** The install's summary, so an abort here lands on the same record as every other one. */
+  summary: InstallSummary = createInstallSummary(),
 ): Promise<ProviderId> {
-  const initialProvider = (getSetting('CLAUDE_MEM_PROVIDER') as ProviderId) || 'claude';
+  // Read the persisted document BEFORE anything can seed it: a settings file
+  // written by the defaults loader holds every shipped default, so reading it
+  // afterwards would report a provider nobody ever chose.
   const persistedSettings = readPersistedInstallerSettings();
-
-  const persistClaudeProvider = (authMethod?: 'subscription' | 'api-key' | 'gateway') => {
-    const resolvedAuthMethod = authMethod ?? resolveClaudeAuthMethod();
-    const wrote = mergeSettings({
-      CLAUDE_MEM_PROVIDER: 'claude',
-      CLAUDE_MEM_CLAUDE_AUTH_METHOD: resolvedAuthMethod,
-    });
-    if (wrote) log.info('Saved Claude Agent SDK configuration to ~/.claude-mem/settings.json');
-  };
+  const initialProvider = (getSetting('CLAUDE_MEM_PROVIDER') as ProviderId) || 'claude';
 
   const useSubscriptionAuth = () => {
     const wrote = mergeSettings(buildAnthropicMaxLocalSettings(persistedSettings));
@@ -1312,19 +1314,28 @@ export async function promptProvider(
     options.providerSource = 'prompt';
     const labels = buildProviderLabels();
 
-    // Multiselect gives both choices square controls. Exactly one provider is
-    // still required; selecting both re-opens the prompt instead of guessing.
+    // The provider the owner already has configured opens selected: the menu
+    // starts on their setup, not on a default they may have moved away from.
+    // A fresh install (nothing configured yet) keeps CMEM Pro selected — it is
+    // the recommended path and the one the funnel is built around. Selecting it
+    // no longer means "pay now": it opens the offer page to read first.
+    const configuredProvider = String(persistedSettings.CLAUDE_MEM_PROVIDER ?? '').trim();
+    const preselectedProvider: ProviderChoice = OFFERED_PROVIDER_CHOICES.includes(configuredProvider as ProviderChoice)
+      ? (configuredProvider as ProviderChoice)
+      : 'cmem';
+
+    // Multiselect gives every choice square controls. Exactly one provider is
+    // still required; selecting several re-opens the prompt instead of guessing.
     while (true) {
       const providerResult = await p.multiselect<ProviderChoice>({
         message: PROVIDER_PROMPT_MESSAGE,
         options: [
           { value: 'cmem', label: labels.cmem, hint: labels.cmemHint },
           { value: 'claude', label: labels.claude, hint: labels.claudeHint },
+          { value: 'openrouter', label: labels.openrouter, hint: labels.openrouterHint },
+          { value: 'openai-compatible', label: labels.openaiCompatible, hint: labels.openaiCompatibleHint },
         ],
-        // CMEM Pro pre-selected: it is the recommended path and the one the
-        // funnel is built around. Selecting it no longer means "pay now" —
-        // it opens the offer page to read first.
-        initialValues: ['cmem'],
+        initialValues: [preselectedProvider],
         required: true,
       });
       // @clack/prompts 1.8: isCancel narrows to unique CANCEL_SYMBOL, not generic symbol.
@@ -1424,10 +1435,21 @@ export async function promptProvider(
   }
 
   if (selectedProvider === 'openai-compatible') {
-    // Only a persisted configuration carries this provider, and it returned
-    // above. The installer has no setup flow for it: the endpoint, model and
-    // key are set in ~/.claude-mem/settings.json.
-    throw new Error('The openai-compatible provider is configured in ~/.claude-mem/settings.json, not by the installer.');
+    // The menu offers this provider, but the installer has no setup flow for
+    // it: the endpoint, model and key live in ~/.claude-mem/settings.json. So
+    // an owner who already configured one keeps that configuration, and an
+    // owner who picked it without one is told what to write instead of being
+    // left with a provider that cannot run.
+    if (String(persistedSettings.CLAUDE_MEM_PROVIDER ?? '').trim() !== 'openai-compatible') {
+      installerError(ErrorSeverity.ABORT, {
+        component: 'provider-credentials',
+        phase: 'provider-selection',
+        cause: new Error('The openai-compatible provider needs an endpoint, a model and a key in ~/.claude-mem/settings.json.'),
+        remediation: 'Set CLAUDE_MEM_OPENAI_COMPAT_BASE_URL, CLAUDE_MEM_OPENAI_COMPAT_MODEL and CLAUDE_MEM_OPENAI_COMPAT_API_KEY (or a CLAUDE_MEM_OPENAI_COMPAT_PRESET) in ~/.claude-mem/settings.json, or pick another provider, then re-run `npx claude-mem install`.',
+      }, summary);
+    }
+    log.info('Kept the openai-compatible provider configuration from ~/.claude-mem/settings.json.');
+    return 'openai-compatible';
   }
 
   const providerLabel = selectedProvider === 'gemini' ? 'Gemini' : 'OpenRouter';
@@ -1458,9 +1480,16 @@ export async function promptProvider(
   });
 
   if (p.isCancel(apiKeyResult)) {
-    log.warn(`API key prompt cancelled — falling back to Claude provider.`);
-    persistClaudeProvider();
-    return 'claude';
+    // Cancelling the key prompt is a decision, not a fallback. Quietly moving
+    // the owner onto the Anthropic subscription would take an OpenRouter setup
+    // (or any other) to a plan they never chose, and would write that choice
+    // into their settings. Abort instead and leave every setting as it was.
+    installerError(ErrorSeverity.ABORT, {
+      component: 'provider-credentials',
+      phase: 'provider-key-prompt',
+      cause: new Error(`The ${providerLabel} API key prompt was cancelled, so no provider was configured.`),
+      remediation: `Nothing was changed. Re-run \`npx claude-mem install\` to paste your ${providerLabel} API key, or pick a different provider.`,
+    }, summary);
   }
 
   const apiKey = String(apiKeyResult).trim();
@@ -3373,7 +3402,7 @@ async function runInstallCommandInner(options: InstallOptions, summary: InstallS
               // At Home: the existing local branch (logged-in Claude SDK account, no claude-mem login).
               options.provider = 'claude';
               options.providerSource = 'browser';
-              browserProvider = await promptProvider(options, null, version);
+              browserProvider = await promptProvider(options, null, version, undefined, summary);
               await promptClaudeModel(options, false);
               return 'home-ready';
             }
@@ -3465,7 +3494,7 @@ async function runInstallCommandInner(options: InstallOptions, summary: InstallS
       oauthPairing = await requireInstallerOAuthLogin(version);
       return oauthPairing;
     };
-    const selectedProvider = await promptProvider(options, oauthPairing, version, signInForCmem);
+    const selectedProvider = await promptProvider(options, oauthPairing, version, signInForCmem, summary);
     if (selectedProvider === 'claude') {
       await promptClaudeModel(options);
     }

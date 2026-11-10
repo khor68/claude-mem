@@ -141,9 +141,11 @@ describe('the cmem memory key stays with the cmem gateway', () => {
     await expect(provider.formatTelegramWrapup(wrapupInput)).rejects.toThrow('OpenRouter API key not configured');
 
     expect(requests.filter(request => request.authorization?.includes(MEMORY_KEY))).toEqual([]);
-    // With no usable key the observer falls through to the Anthropic plan
-    // instead of calling the new host with the account's credential.
-    expect(selectProviderForGenerator()).toEqual({ provider: 'claude', gatewayProbeClaimId: null });
+    // The observer stays on the selected provider. It has no usable key, so the
+    // request fails there with the provider's own error ("OpenRouter API key
+    // not configured") instead of running on the Anthropic plan — and no
+    // credential reaches the new host either way.
+    expect(selectProviderForGenerator()).toEqual({ provider: 'openrouter', gatewayProbeClaimId: null });
   });
 
   it('still reaches the gateway with the memory key when the base URL is untouched', async () => {

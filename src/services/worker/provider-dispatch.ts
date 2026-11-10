@@ -2,9 +2,11 @@
  * The one provider-dispatch rule, shared by SessionRoutes (generator start)
  * and worker-service (getAiStatus) — previously duplicated in both.
  *
- * Semantics: openrouter wins when selected AND a key exists; else gemini when
- * selected AND a key exists; else openai-compatible when selected AND fully
- * configured; else claude (silent fall-through, unchanged).
+ * Semantics: the selected provider wins. A selected provider that is not
+ * configured stays SELECTED — it fails on its own error instead of silently
+ * becoming claude, because falling through would spend the user's Anthropic
+ * subscription on work they routed to another provider. claude is the
+ * provider only when no other one is selected.
  *
  * Trial-expiry fallback (plan 2026-08-26 Phase 6): when the selected
  * openrouter config points at the cmem.ai gateway AND a terminal gateway
@@ -14,15 +16,22 @@
  * so subscribing can recover automatically. User-owned openrouter.ai (or any
  * non-gateway) base URLs ignore the fallback marker entirely.
  *
- * Provider fallback (CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER, default 'claude' —
- * the Anthropic plan): while the selected provider's breaker holds because it
- * cannot serve (a spent allowance, a rate limit or over-capacity refusal that
- * outlasted its retries, an outage or repeated unusable replies — see
- * routeAroundUnservableProvider), every plain return is routed to the
- * fallback, provided it can serve (for Claude: a Claude login or key exists)
- * and is not itself held. Once the window elapses the primary is re-probed and
- * takes the work back. 'off' leaves dispatch waiting on the primary. The
- * cmem-gateway branch keeps its own marker and runs first, untouched.
+ * Provider fallback (CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER): while the selected
+ * provider's breaker holds because it cannot serve (a spent allowance, a rate
+ * limit or over-capacity refusal that outlasted its retries, an outage or
+ * repeated unusable replies — see routeAroundUnservableProvider), every plain
+ * return is routed to the fallback, provided it can serve (for Claude: a Claude
+ * login or key exists) and is not itself held. Once the window elapses the
+ * primary is re-probed and takes the work back. 'off' leaves dispatch waiting
+ * on the primary. The cmem-gateway branch keeps its own marker and runs first,
+ * untouched.
+ *
+ * The DEFAULT fallback (nothing chosen) is the Anthropic plan only where the
+ * product promises it: a claude primary, and the cmem.ai gateway. A personal
+ * OpenRouter, OpenAI-compatible or Gemini install gets no default backup —
+ * spending the user's Anthropic subscription because their own provider ran
+ * out is not a choice they made. CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER=claude
+ * turns it on for those installs.
  */
 
 import { SettingsDefaultsManager, type SettingsDefaults } from '../../shared/SettingsDefaultsManager.js';
@@ -130,6 +139,55 @@ export function readQuotaFallbackProvider(): QuotaFallbackProvider | null {
 }
 
 /**
+ * The raw CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER choice, as the user made it: the
+ * env override when there is one, else the persisted value, else ''.
+ *
+ * The settings reader merges the defaults, where the fallback is 'claude', so
+ * the merged value cannot tell an explicit 'claude' from "nothing chosen" —
+ * and that difference decides whether the Anthropic plan is the backup. The
+ * raw choice is therefore read here, not the merged one.
+ */
+function readRawQuotaFallbackProvider(): string {
+  const override = process.env.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER;
+  if (override !== undefined) return override.trim();
+  try {
+    const document = parseJsonWithBom<Record<string, unknown>>(readFileSync(paths.settings(), 'utf8'));
+    return String(settingsTarget(document).CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER ?? '').trim();
+  } catch {
+    // No settings file, or one that cannot be read: nothing was chosen.
+    return '';
+  }
+}
+
+/** Whether the OpenRouter provider points at the cmem.ai gateway. */
+function usesCmemGateway(): boolean {
+  return isCmemGatewayUrl(resolveOpenRouterConfig(paths.settings()).apiUrl);
+}
+
+/**
+ * The provider that takes over while `primary` cannot serve.
+ *
+ * An explicit choice is honoured as it is — including 'off', which turns the
+ * backup off. The DEFAULT (nothing chosen) is the Anthropic plan only where
+ * the product promises it: a claude primary (the plan the user is already on)
+ * and the cmem.ai gateway (its installer promises the plan as the backup). A
+ * personal OpenRouter, OpenAI-compatible or Gemini install gets NO default
+ * backup: spending the user's Anthropic subscription because their own
+ * provider ran out is not a choice they made.
+ * CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER=claude turns it on for those installs.
+ */
+export function effectiveQuotaFallbackProvider(primary: QuotaProvider): QuotaFallbackProvider | null {
+  const raw = readRawQuotaFallbackProvider();
+  if (raw === '') {
+    if (primary === 'claude') return 'claude';
+    if (primary === 'openrouter' && usesCmemGateway()) return 'claude';
+    return null;
+  }
+  if (raw === QUOTA_FALLBACK_OFF) return null;
+  return (QUOTA_FALLBACK_PROVIDERS as readonly string[]).includes(raw) ? raw as QuotaFallbackProvider : null;
+}
+
+/**
  * The cmem gateway as the openrouter fallback, by its trial-expiry marker:
  * 'not-refusing' when the endpoint is not the gateway or no marker is set,
  * 'refusing' inside the marker's window (shouldUseCmemFallback), 'probe' once
@@ -215,7 +273,7 @@ export function quotaFallbackTarget(
   primary: QuotaProvider,
   nowMs: number = Date.now(),
 ): QuotaFallbackProvider | null {
-  const fallback = readQuotaFallbackProvider();
+  const fallback = effectiveQuotaFallbackProvider(primary);
   if (fallback === null || fallback === primary) return null;
   if (!isFallbackAvailable(fallback)) return null;
   if (isQuotaCooldownHolding(fallback, nowMs)) return null;
@@ -292,10 +350,13 @@ function noteQuotaFallbackTransition(primary: SelectableProvider, routed: Routed
       return;
     case 'blocked': {
       // Distinct from probing: nothing is being probed and nothing can take
-      // the work. Name the real cause — the fallback may be held too, or it may
-      // simply be unable to serve (no credentials, or equal to the primary).
-      const fallback = readQuotaFallbackProvider();
-      if (fallback !== null && fallback !== primary && isQuotaCooldownHolding(fallback, nowMs)) {
+      // the work. Name the real cause — there may be no backup at all, the
+      // fallback may be held too, or it may simply be unable to serve (no
+      // credentials, or equal to the primary).
+      const fallback = effectiveQuotaFallbackProvider(primary);
+      if (fallback === null) {
+        logger.warn('SESSION', 'Primary in quota cooldown and no quota fallback is configured; capture waits until it clears', { primary });
+      } else if (fallback !== primary && isQuotaCooldownHolding(fallback, nowMs)) {
         logger.warn('SESSION', 'Primary and fallback both in quota cooldown; capture waits until one clears', { primary, fallback });
       } else {
         logger.warn('SESSION', 'Primary in quota cooldown and the quota fallback cannot serve; capture waits until it clears', { primary, fallback });
@@ -306,6 +367,20 @@ function noteQuotaFallbackTransition(primary: SelectableProvider, routed: Routed
       logger.info('SESSION', 'Primary recovered from quota cooldown', { primary });
       return;
   }
+}
+
+/**
+ * Whether the quota-fallback transition log runs at all.
+ *
+ * An explicit 'off' — and an unrecognised value, which reads as off — means
+ * the user turned the backup off, so there is nothing to report. The default
+ * (nothing chosen) IS reported: when the primary is held and no backup can
+ * take the work, the owner still needs to see that nothing is serving.
+ */
+function quotaFallbackLoggingEnabled(): boolean {
+  const raw = readRawQuotaFallbackProvider();
+  if (raw === QUOTA_FALLBACK_OFF) return false;
+  return raw === '' || (QUOTA_FALLBACK_PROVIDERS as readonly string[]).includes(raw);
 }
 
 /**
@@ -324,7 +399,7 @@ function selectWithQuotaFallback(primary: SelectableProvider): ProviderSelection
     if (admission.admitted) gatewayProbeClaimId = admission.claimId;
     else routed = { provider: primary, fallbackFrom: null };
   }
-  if (readQuotaFallbackProvider() !== null) {
+  if (quotaFallbackLoggingEnabled()) {
     noteQuotaFallbackTransition(primary, routed, nowMs);
   }
   return routed.fallbackFrom === null
@@ -364,7 +439,7 @@ function routedProviderFor(primary: SelectableProvider): SelectableProvider {
 /**
  * Where memory capture runs while `held` is in a quota cooldown: the provider
  * dispatch is using, when that is a different one and not itself holding.
- * Null otherwise, and always null with the fallback turned off.
+ * Null otherwise.
  *
  * Read by the session-start notice, through the mirrored cooldown. It asks
  * dispatch rather than `quotaFallbackTarget(held)` because the held provider
@@ -380,15 +455,16 @@ function routedProviderFor(primary: SelectableProvider): SelectableProvider {
 export function quotaServingProvider(held: QuotaProvider, nowMs: number = Date.now()): SelectableProvider | null {
   // The primary Claude credential is held, but runs go on the other one meanwhile.
   if (held === 'claude' && claudeQuotaStandIn()) return 'claude';
-  if (readQuotaFallbackProvider() === null) return null;
   // The held provider's own routing when it is a primary here (the global one
   // or a mapped one). Otherwise it is only a fallback, and capture continues
   // only if every route still has a provider serving: a primary that was
   // counting on it may now be waiting.
   const primaries = [globalPrimary(), ...readProviderBySource().values()].filter(isProviderConfigured);
   const routes = (primaries.includes(held as SelectableProvider) ? [held as SelectableProvider] : primaries).map(routedProviderFor);
+  // Nothing is routed anywhere: no primary is configured, so nobody serves.
+  if (routes.length === 0) return null;
   if (routes.some(serving => serving === held || isQuotaCooldownHolding(serving, nowMs))) return null;
-  return routes[0];
+  return routes[0] ?? null;
 }
 
 function quotaProviderDisplayName(provider: string, settings: SettingsDefaults, auth?: string): string {
@@ -405,17 +481,13 @@ function quotaProviderDisplayName(provider: string, settings: SettingsDefaults, 
   }
 }
 
-/** Defaults are merged by the settings reader; inspect the actual choice for the opt-out hint. */
-function usesDefaultClaudeBackup(): boolean {
-  const override = process.env.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER;
-  if (override !== undefined) return override.trim() === '';
-  try {
-    const document = parseJsonWithBom<Record<string, unknown>>(readFileSync(paths.settings(), 'utf8'));
-    return !String(settingsTarget(document).CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER ?? '').trim();
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
-    throw error;
-  }
+/**
+ * Whether the Anthropic plan is the backup because nothing was chosen — the
+ * one case where the notice may offer the opt-out. With an explicit choice the
+ * user already decided, and with no backup at all there is nothing to offer.
+ */
+function usesDefaultClaudeBackup(primary: SelectableProvider): boolean {
+  return readRawQuotaFallbackProvider() === '' && effectiveQuotaFallbackProvider(primary) === 'claude';
 }
 
 /** Display-only snapshot: dispatch still owns every routing and admission decision. */
@@ -430,7 +502,7 @@ const quotaNoticeResolution: QuotaFallbackResolver = (held, nowMs, activeHolds) 
   const selected = settings.CLAUDE_MEM_PROVIDER;
   const main = (['claude', 'gemini', 'openrouter', 'codex', 'openai-compatible'] as string[]).includes(selected)
     ? selected : 'claude';
-  const backup = readQuotaFallbackProvider();
+  const backup = effectiveQuotaFallbackProvider(main as SelectableProvider);
   // Where main's runs actually go: Claude while cmem.ai's trial-expiry
   // fallback stands, so a hold on it is a hold on the provider doing the work.
   const routed = routedProviderFor(main as SelectableProvider);
@@ -465,7 +537,7 @@ const quotaNoticeResolution: QuotaFallbackResolver = (held, nowMs, activeHolds) 
       mainDisplayName: displayName(main, mainAuth),
       mainRetryName: retryName(main, mainAuth),
       ...(backup && backup !== main ? { backupProvider: backup, backupDisplayName: displayName(backup, mainAuth) } : {}),
-      defaultClaudeBackup: usesDefaultClaudeBackup(),
+      defaultClaudeBackup: usesDefaultClaudeBackup(main as SelectableProvider),
       ...(serving ? { servingProvider: serving, servingDisplayName } : {}),
       ...(servingAuth ? { servingAuth } : {}),
       holds,
@@ -507,16 +579,55 @@ export function selectProviderForGenerator(platformSource?: string): ProviderSel
 }
 
 /**
- * The provider the global settings name, by the same order getSelectedProvider
- * reads: codex, openrouter, gemini and openai-compatible each when selected
- * and configured, else claude.
+ * The provider the global settings name: codex, openrouter, gemini or
+ * openai-compatible when that one is selected, else claude.
+ *
+ * A selected provider that is not configured stays SELECTED. Falling through
+ * to claude here would spend the user's Anthropic subscription on work they
+ * routed to another provider — the one thing the selection rules out. The run
+ * fails on the provider the user chose, with that provider's own error, and
+ * the owner is told once that the selection has nothing to authenticate with.
  */
 function globalPrimary(): SelectableProvider {
   if (isCodexSelected()) return 'codex';
-  if (isOpenRouterSelected() && isOpenRouterAvailable()) return 'openrouter';
-  if (isGeminiSelected() && isGeminiAvailable()) return 'gemini';
-  if (isOpenAICompatSelected() && isOpenAICompatAvailable()) return 'openai-compatible';
+  if (isOpenRouterSelected()) {
+    if (!isOpenRouterAvailable()) warnUnconfiguredProvider('openrouter');
+    return 'openrouter';
+  }
+  if (isGeminiSelected()) {
+    if (!isGeminiAvailable()) warnUnconfiguredProvider('gemini');
+    return 'gemini';
+  }
+  if (isOpenAICompatSelected()) {
+    if (!isOpenAICompatAvailable()) warnUnconfiguredProvider('openai-compatible');
+    return 'openai-compatible';
+  }
   return 'claude';
+}
+
+/**
+ * The providers already warned about, so the warning is once per provider
+ * rather than once per dispatch.
+ */
+const warnedUnconfiguredProviders = new Set<SelectableProvider>();
+
+/**
+ * A selected provider with nothing to authenticate with: the work cannot run
+ * there, and it must not run on the Anthropic plan instead. Say so once.
+ */
+function warnUnconfiguredProvider(provider: SelectableProvider): void {
+  if (warnedUnconfiguredProviders.has(provider)) return;
+  warnedUnconfiguredProviders.add(provider);
+  logger.warn(
+    'SESSION',
+    `CLAUDE_MEM_PROVIDER=${provider} is selected but has no API key configured; work is not sent to another provider`,
+    { provider },
+  );
+}
+
+/** Test seam: forget the unconfigured selections already warned about. */
+export function resetUnconfiguredProviderWarningsForTesting(): void {
+  warnedUnconfiguredProviders.clear();
 }
 
 /** Whether `provider` has what it needs to be a primary (claude and codex have no key to check). */

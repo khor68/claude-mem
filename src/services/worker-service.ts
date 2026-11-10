@@ -212,7 +212,7 @@ import { applyPendingRestore } from './backup/restore-swap.js';
 
 import { CorpusStore } from './worker/knowledge/CorpusStore.js';
 import { CorpusBuilder } from './worker/knowledge/CorpusBuilder.js';
-import { KnowledgeAgent } from './worker/knowledge/KnowledgeAgent.js';
+import { createCorpusAgent } from './worker/knowledge/CorpusAgent.js';
 import { cliFlagValue } from '../shared/cli-flag-value.js';
 
 export interface StatusOutput {
@@ -1251,8 +1251,11 @@ export class WorkerService implements WorkerRef {
         searchManager.getOrchestrator(),
         this.corpusStore
       );
-      const knowledgeAgent = new KnowledgeAgent(this.corpusStore);
-      this.corpusRoutes = new CorpusRoutes(this.corpusStore, corpusBuilder, knowledgeAgent);
+      // The corpus agent follows the selected provider: an install that chose
+      // an API endpoint answers its corpus questions there, not on the
+      // Anthropic plan (see knowledge/CorpusAgent.ts).
+      const corpusAgent = await createCorpusAgent(this.corpusStore);
+      this.corpusRoutes = new CorpusRoutes(this.corpusStore, corpusBuilder, corpusAgent);
       this.server.registerRoutes(this.corpusRoutes);
       logger.info('WORKER', 'CorpusRoutes registered');
 
